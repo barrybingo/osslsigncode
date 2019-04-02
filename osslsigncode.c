@@ -67,6 +67,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 typedef unsigned char u_char;
+#include "windows/strptime.c"
 #endif
 
 #include <stdio.h>
@@ -439,6 +440,7 @@ IMPLEMENT_ASN1_FUNCTIONS(TimeStampReq)
 
 #endif /* ENABLE_CURL */
 
+#define pkcs7_add_fixed_timestamp(si, t) PKCS7_add_signed_attribute(si, NID_pkcs9_signingTime, V_ASN1_UTCTIME, t)
 
 static SpcSpOpusInfo* createOpus(const char *desc, const char *url)
 {
@@ -477,7 +479,7 @@ static void tohex(const unsigned char *v, char *b, int len)
 		sprintf(b+i*2, "%02X", v[i]);
 }
 
-static int add_unauthenticated_blob(PKCS7 *sig)
+static int add_unauthenticated_blob(PKCS7 *sig, ASN1_TIME* fixedtimestamp)
 {
 	u_char *p = NULL;
 	int len = 1024+4;
@@ -485,6 +487,9 @@ static int add_unauthenticated_blob(PKCS7 *sig)
 	char postfix[] = "---END_BLOB---";
 
 	PKCS7_SIGNER_INFO *si = sk_PKCS7_SIGNER_INFO_value(sig->d.sign->signer_info, 0);
+
+	if (fixedtimestamp)
+		pkcs7_add_fixed_timestamp(si, fixedtimestamp);
 
 	p = OPENSSL_malloc(len);
 	memset(p, 0, len);
@@ -837,6 +842,7 @@ static void usage(const char *argv0)
 			"\t\t[ -t <timestampurl> [ -t ... ] [ -p <proxy> ] [ -noverifypeer ] ]\n"
 			"\t\t[ -ts <timestampurl> [ -ts ... ] [ -p <proxy> ] [ -noverifypeer ] ]\n"
 #endif
+			"\t\t[ -tf <fixed timestamp \"Y-m-d H:M:S\">\n"
 			"\t\t[ -addUnauthenticatedBlob ]\n\n"
 			"\t\t[ -nest ]\n\n"
 			"\t\t[ -verbose ]\n\n"
@@ -855,6 +861,7 @@ static void usage(const char *argv0)
 			"\t\t[ -t <timestampurl> [ -t ... ] [ -p <proxy> ] [ -noverifypeer ] ]\n"
 			"\t\t[ -ts <timestampurl> [ -ts ... ] [ -p <proxy> ] [ -noverifypeer ] ]\n"
 #endif
+			"\t\t[ -tf <fixed timestamp \"Y-m-d H:M:S\">\n"
 			"\n"
 			"",
 			argv0);
@@ -1239,7 +1246,7 @@ static PKCS7 *pkcs7_get_nested_signature(PKCS7 *p7, int *has_sig)
  * pkcs7_set_nested_signature adds the p7nest signature to p7
  * as a nested signature (SPC_NESTED_SIGNATURE).
  */
-static int pkcs7_set_nested_signature(PKCS7 *p7, PKCS7 *p7nest)
+static int pkcs7_set_nested_signature(PKCS7 *p7, PKCS7 *p7nest, ASN1_TIME* fixedtimestamp)
 {
 	u_char *p = NULL;
 	int len = 0;
@@ -1255,6 +1262,10 @@ static int pkcs7_set_nested_signature(PKCS7 *p7, PKCS7 *p7nest)
 	OPENSSL_free(p);
 
 	PKCS7_SIGNER_INFO *si = sk_PKCS7_SIGNER_INFO_value(p7->d.sign->signer_info, 0);
+
+	if (fixedtimestamp)
+		pkcs7_add_fixed_timestamp(si, fixedtimestamp);
+
 	if (PKCS7_add_attribute(si, OBJ_txt2nid(SPC_NESTED_SIGNATURE_OBJID), V_ASN1_SEQUENCE, astr) == 0)
 		return 0;
 
@@ -2338,12 +2349,13 @@ int main(int argc, char **argv) {
 	PKCS7_SIGNER_INFO *si;
 	ASN1_STRING *astr;
 	const EVP_MD *md;
+	ASN1_TIME * fixedtimestamp = NULL;
 
 	const char *argv0 = argv[0];
 	static char buf[64*1024];
 	char *xcertfile, *certfile, *keyfile, *pvkfile, *pkcs12file, *infile, *outfile, *sigfile, *desc, *url, *indata, *insigdata, *outdataverify;
 	char *p11engine, *p11module;
-	char *pass = NULL, *readpass = NULL;
+	char *pass = NULL, *readpass = NULL, *suppliedtimestr = NULL;
 	int output_pkcs7 = 0;
 	int askpass = 0;
 	char *leafhash = NULL;
@@ -2500,6 +2512,10 @@ int main(int argc, char **argv) {
 		} else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-i")) {
 			if (--argc < 1) usage(argv0);
 			url = *(++argv);
+		}
+		else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-tf")) {
+			if (--argc < 1) usage(argv0);
+			suppliedtimestr = *(++argv);
 #ifdef ENABLE_CURL
 		} else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-t")) {
 			if (--argc < 1) usage(argv0);
@@ -2584,12 +2600,23 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	if (argc > 0 || (nturl && ntsurl) || !infile ||
+	if (argc > 0 || (nturl && ntsurl) || !infile || ((nturl || ntsurl) && suppliedtimestr) ||
 		(cmd != CMD_VERIFY && !outfile) ||
 		(cmd == CMD_SIGN && !((certfile && keyfile) || pkcs12file || (p11engine && p11module)))) {
 		if (failarg)
 			fprintf(stderr, "Unknown option: %s\n", failarg);
 		usage(argv0);
+	}
+
+
+	if (suppliedtimestr) {
+		struct tm tm = { 0 };
+		if (!strptime(suppliedtimestr, "%Y-%m-%d %H:%M:%S", &tm))
+		{
+			fprintf(stderr, "Error parsing time string: \"%s\"\n", suppliedtimestr);
+			usage(argv0);
+		}
+		fixedtimestamp = ASN1_TIME_set(NULL, mktime(&tm));
 	}
 
 	if (readpass) {
@@ -2668,7 +2695,7 @@ int main(int argc, char **argv) {
 
 			if (1 != ENGINE_ctrl_cmd_string(pkcs11, "MODULE_PATH", p11module, CMD_MANDATORY))
 				DO_EXIT_1("Failed to set pkcs11 engine MODULE_PATH to '%s'", p11module);
-		
+
 			if (pass != NULL) {
 				if (1 != ENGINE_ctrl_cmd_string(pkcs11, "PIN", pass, CMD_MANDATORY))
 					DO_EXIT_0("Failed to set pkcs11 PIN");
@@ -3081,13 +3108,18 @@ int main(int argc, char **argv) {
 	PKCS7_set_type(sig, NID_pkcs7_signed);
 
 	si = NULL;
-	if (cert != NULL)
+	if (cert != NULL) {
 		si = PKCS7_add_signature(sig, cert, pkey, md);
+		if (fixedtimestamp)
+			pkcs7_add_fixed_timestamp(si, fixedtimestamp);
+	}
 	if (si == NULL) {
 		for (i=0; i<sk_X509_num(certs); i++) {
 			X509 *signcert = sk_X509_value(certs, i);
 			/* X509_print_fp(stdout, signcert); */
 			si = PKCS7_add_signature(sig, signcert, pkey, md);
+			if (fixedtimestamp)
+				pkcs7_add_fixed_timestamp(si, fixedtimestamp);
 			if (si != NULL) break;
 		}
 	}
@@ -3222,7 +3254,7 @@ add_only:
 		DO_EXIT_0("RFC 3161 timestamping failed\n");
 #endif
 
-	if (addBlob && add_unauthenticated_blob(sig))
+	if (addBlob && add_unauthenticated_blob(sig, fixedtimestamp))
 		DO_EXIT_0("Adding unauthenticated blob failed\n");
 
 
@@ -3235,7 +3267,7 @@ add_only:
 		if (cursig == NULL) {
 			DO_EXIT_0("no 'cursig' was extracted. this points to a bug in the code. aborting...\n")
 		}
-		if (pkcs7_set_nested_signature(cursig, sig) == 0)
+		if (pkcs7_set_nested_signature(cursig, sig, fixedtimestamp) == 0)
 			DO_EXIT_0("unable to append the nested signature to the current signature\n");
 		outsig = cursig;
 	} else {
@@ -3378,6 +3410,8 @@ err_cleanup:
 		BIO_free_all(hash);
 	if (outfile)
 		unlink(outfile);
+	if (fixedtimestamp)
+		ASN1_STRING_free(fixedtimestamp);
 	fprintf(stderr, "\nFailed\n");
 	cleanup_lib_state();
 	return -1;
